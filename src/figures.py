@@ -228,6 +228,35 @@ def _matplotlib_table_fallback(df, num_cols, best, out):
 
 
 # --------------------------------------------------------------------------- #
+def load_pr_models(device="cpu") -> dict:
+    """Load trained Arch A / Arch B (BCE) checkpoints for real PR curves.
+
+    Missing/unloadable checkpoints are skipped (that method falls back to a
+    synthetic curve through its operating point). Note: Arch A's PR curve runs
+    the 200-step rollout over all eval windows — fast on GPU, slow on CPU.
+    """
+    import lora_arch_a
+    import lora_arch_b
+
+    ck = data.PROJECT_ROOT / "outputs" / "checkpoints"
+    models: dict = {}
+    if (ck / "arch_a" / "best").exists():
+        try:
+            models["arch_a"] = lora_arch_a.load_model(ck / "arch_a" / "best", device=device)
+            print("[fig] loaded Arch A checkpoint")
+        except Exception as e:  # noqa: BLE001
+            print(f"[fig] Arch A checkpoint not loaded: {e}")
+    if (ck / "arch_b" / "best").exists():
+        try:
+            models["arch_b"] = lora_arch_b.load_model(ck / "arch_b", device=device)
+            print("[fig] loaded Arch B (BCE) checkpoint")
+        except Exception as e:  # noqa: BLE001
+            print(f"[fig] Arch B checkpoint not loaded: {e}")
+    if not models:
+        print("[fig] no checkpoints found -> PR arch curves will be synthetic")
+    return models
+
+
 def make_all(models=None, synthetic=False):
     data_efficiency_curve(synthetic=synthetic)
     pr_curve_figure(models=models, synthetic=synthetic)
@@ -237,12 +266,16 @@ def make_all(models=None, synthetic=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--synthetic", action="store_true", help="footnote figures as illustrative")
+    ap.add_argument("--with-models", action="store_true",
+                    help="load trained checkpoints for real PR arch curves")
+    ap.add_argument("--device", default="cpu")
     ap.add_argument("--which", choices=["all", "efficiency", "pr", "table"], default="all")
     args = ap.parse_args()
+    models = load_pr_models(args.device) if args.with_models else None
     if args.which in ("all", "efficiency"):
         data_efficiency_curve(synthetic=args.synthetic)
     if args.which in ("all", "pr"):
-        pr_curve_figure(synthetic=args.synthetic)
+        pr_curve_figure(models=models, synthetic=args.synthetic)
     if args.which in ("all", "table"):
         metrics_table()
 

@@ -78,6 +78,44 @@ Use `--epochs N` on `experiments.py` / arch scripts for quick GPU smoke runs.
 7. **Diversity homogeneous condition samples with replacement** to reach 40 traces
    per config (each config's training pool has only 27), logged at runtime.
 
+## Training on a GPU box, evaluating / plotting here
+
+Bring back only small artifacts — the base weights, raw data and `.cache_npz` are
+not needed (the eval split and θ recompute identically, verified). All of the
+below is < ~5 MB.
+
+**Always commit the results CSVs** (they hold every number and drive 2 of 3 figures):
+
+```
+outputs/results/metrics_main.csv
+outputs/results/metrics_data_efficiency.csv
+outputs/results/metrics_diversity.csv
+```
+Then here: `python src/figures.py` → real `data_efficiency_curve.pdf` and
+`metrics_table.pdf`; `pr_curve.pdf` has real operating-point dots but
+synthetic-shaped arch curves.
+
+**Also commit the checkpoints** to get the *real* PR curve here and to be able to
+re-run `evaluate`:
+
+```
+outputs/checkpoints/arch_a/best/{adapter_config.json,adapter_model.safetensors}
+outputs/checkpoints/arch_b/best/{adapter_config.json,adapter_model.safetensors}
+outputs/checkpoints/arch_b/{head.pt,meta.json}
+outputs/checkpoints/arch_b_focal/...        # optional (focal is for the table only)
+```
+Then: `python src/figures.py --with-models` → real `pr_curve.pdf`.
+Checkpoint load is bit-exact (verified: Δforecast = Δlogits = 0).
+
+**Simplest of all:** run `python src/figures.py` *on the GPU box* and commit the
+three finished PDFs + three CSVs — nothing to compute here.
+
+Caveats: (1) Arch A's `--with-models` PR curve runs the 200-step rollout over
+~1,900 eval windows — fast on GPU, slow (tens of min) on this CPU; prefer
+generating that figure on the GPU box. (2) The GPU-written CSVs are authoritative;
+re-evaluating from checkpoints on CPU (fp32) may differ in the last digit from a
+GPU fp16/bf16 run, so don't overwrite the CSVs here unless you want CPU numbers.
+
 ## Note on training compute
 
 This machine has no CUDA GPU, so the 42 data-efficiency runs + diversity runs are

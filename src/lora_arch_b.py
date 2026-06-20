@@ -98,6 +98,7 @@ def load_model(adapter_dir: Path = CKPT_DIR, device: str | None = None):
     import torch
     from peft import PeftModel
 
+    adapter_dir = Path(adapter_dir)
     device = lc.pick_device(device)
     base = lc.load_backbone(device)
     peft_model = PeftModel.from_pretrained(base, str(adapter_dir / "best"))
@@ -313,7 +314,11 @@ def main():
     if args.smoke:
         smoke()
     else:
-        train(loss_kind=args.loss, epochs=args.epochs, batch_size=args.batch_size, seed=args.seed)
+        # Keep the two losses in separate dirs so they don't overwrite each
+        # other; BCE is the canonical arch_b checkpoint used by the PR curve.
+        save_dir = CKPT_DIR if args.loss == "bce" else CKPT_DIR.parent / "arch_b_focal"
+        train(loss_kind=args.loss, epochs=args.epochs, batch_size=args.batch_size,
+              seed=args.seed, save_dir=save_dir)
 
 
 if __name__ == "__main__":
