@@ -1,0 +1,19 @@
+# Fine-tuning pipeline for sub-THz blockage prediction.
+# Tested with Python 3.10 on CPU (data/eval/figures) and intended for a single
+# 16 GB GPU for training. Versions below are the ones this code was verified against.
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14
+scipy>=1.11
+scikit-learn>=1.3
+matplotlib>=3.7
+
+# Deep-learning stack. transformers must be recent enough to expose
+# TimesFm2_5ModelForPrediction (model_type "timesfm2_5"); 5.12+ is known-good.
+torch>=2.4
+transformers>=5.12
+peft>=0.13
+accelerate>=0.34
+safetensors>=0.4
+huggingface_hub>=0.25
+einops>=0.7
