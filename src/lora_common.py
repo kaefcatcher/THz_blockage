@@ -67,7 +67,11 @@ def load_backbone(device: str | None = None, dtype=None, attn_implementation: st
     from transformers import TimesFm2_5ModelForPrediction
 
     device = pick_device(device)
-    kw = {"torch_dtype": resolve_dtype(dtype)}
+    td = resolve_dtype(dtype)
+    if td in (torch.float16, torch.bfloat16) and device != "cuda":
+        print(f"[warn] {td} requested on device={device}; some half-precision ops are "
+              f"only implemented on CUDA and may error. Use fp32 off-GPU.")
+    kw = {"torch_dtype": td}
     if attn_implementation:
         kw["attn_implementation"] = attn_implementation
     model = TimesFm2_5ModelForPrediction.from_pretrained(BACKBONE_ID, **kw)
@@ -127,6 +131,54 @@ def last_layer_module(model):
     """The final transformer block (for the Arch-B hidden-state hook)."""
     _prefix, layers = find_layer_list(model)
     return layers[-1]
+
+
+def enable_layer_checkpointing(model):
+    """Per-layer activation checkpointing on the *trainable* transformer layers.
+
+    The model's built-in ``gradient_checkpointing`` flag is dead code (its layer
+    loop never checks it), so we wrap each layer's ``forward`` with
+    ``torch.utils.checkpoint`` ourselves. Only layers that actually hold LoRA
+    params (16-19) store activations for backward, so we checkpoint exactly those
+    — peak activation memory drops from ~4 trainable layers (x2 for Arch A's
+    rollout) to ~1 layer recomputed at a time. ``use_reentrant=False`` works even
+    though the layer input doesn't require grad.
+    """
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    _prefix, layers = find_layer_list(model)
+    n = 0
+    for layer in layers:
+        if getattr(layer, "_ckpt_wrapped", False):
+            continue
+        if not any(p.requires_grad for p in layer.parameters()):
+            continue  # frozen layers don't store activations anyway
+        orig = layer.forward
+
+        def make(fwd):
+            def wrapped(hidden_states, *args, **kwargs):
+                if torch.is_grad_enabled():
+                    return checkpoint(
+                        lambda hs: fwd(hs, *args, **kwargs), hidden_states, use_reentrant=False
+                    )
+                return fwd(hidden_states, *args, **kwargs)
+            return wrapped
+
+        layer.forward = make(orig)
+        layer._ckpt_wrapped = True
+        n += 1
+    print(f"[lora] per-layer gradient checkpointing on {n} trainable layers")
+    return model
+
+
+def cuda_peak_gb(device) -> float | None:
+    """Peak allocated memory (GiB) on a CUDA device, else None."""
+    import torch
+
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1024**3
+    return None
 
 
 # --------------------------------------------------------------------------- #

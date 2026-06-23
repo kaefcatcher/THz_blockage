@@ -80,35 +80,44 @@ Use `--epochs N` on `experiments.py` / arch scripts for quick GPU smoke runs.
 
 ## Out-of-memory during training
 
-The backbone already uses `sdpa` (memory-efficient attention) by default, so
-`flash_attention_2` gives only a marginal gain over what you have — and it needs
-the `flash-attn` package plus a CUDA Ampere+ GPU. The levers that actually move
-peak memory, cheapest first:
+**The flags are opt-in** — the bare `python src/lora_arch_a.py` still runs the
+spec defaults (batch 64, fp32, no checkpointing), whose peak is **~7 GB** and will
+OOM an 8 GB GPU. If you saw ~7 GB after "applying the fix", the flags almost
+certainly didn't reach training. Each run now prints its effective config and
+per-epoch `peak=X.XXGB`, e.g.
+
+```
+[arch_a] train traces=194 val traces=22 Tw=50ms bs=8 accum=8 dtype=bf16 ckpt=True
+[arch_a] epoch 01  train_MAE=...  val_MAE=...  (NNs)  peak=1.4GB
+```
+
+If that line says `bs=64 ... dtype=fp32 ckpt=False`, the flags weren't applied —
+check the exact command.
+
+**One-flag fix for small GPUs:**
+
+```bash
+python src/lora_arch_a.py --low-mem      # = bf16(CUDA) + grad-checkpoint + batch 8 + accum 8
+python src/lora_arch_b.py --low-mem
+python src/experiments.py efficiency --bf16 --grad-checkpoint --batch-size 8 --accum-steps 8
+```
+
+Individual levers (cheapest first):
 
 | Lever | Flag | Effect |
 |-------|------|--------|
-| smaller batch | `--batch-size 16` | ~linear memory drop; fixes a small overshoot instantly |
-| gradient accumulation | `--accum-steps 4` | keep effective batch, pay memory for only the micro-batch |
-| bfloat16 | `--bf16` | ~halves weight **and** activation memory |
-| activation checkpointing | `--grad-checkpoint` | recompute activations in backward; biggest cut, ~+1 forward of compute |
-| flash attention | `--attn flash_attention_2` | marginal here; needs `flash-attn` + CUDA |
+| smaller batch | `--batch-size 16` | ~linear memory drop |
+| gradient accumulation | `--accum-steps 4` | keeps the effective batch at the per-step memory of the micro-batch |
+| bfloat16 | `--bf16` | ~halves weight **and** activation memory (**CUDA only** — some bf16 ops aren't implemented on CPU) |
+| per-layer checkpointing | `--grad-checkpoint` | recomputes the 4 trainable layers' activations in backward; biggest cut |
+| flash attention | `--attn flash_attention_2` | marginal — already `sdpa` by default; needs `flash-attn` + CUDA Ampere+ |
 
-Arch A is the memory-heavy one: its 200-step forecast is a **2× rollout** (two
-backbone forwards kept in the graph), so `--grad-checkpoint` is the highest-impact
-flag there. For a ~100 MB overshoot, `--batch-size 32` alone is usually enough.
-Examples:
-
-```bash
-python src/lora_arch_a.py --batch-size 16                 # quick fix
-python src/lora_arch_a.py --bf16 --grad-checkpoint        # large headroom
-python src/lora_arch_a.py --batch-size 16 --accum-steps 4 # effective batch 64
-# same flags exist on lora_arch_b.py and experiments.py
-python src/experiments.py efficiency --bf16 --grad-checkpoint --batch-size 32
-```
-
-These don't change results (accumulation preserves the effective batch; bf16 is a
-minor numerical change). Combining `--bf16 --grad-checkpoint --batch-size 16`
-brings Arch A from its fp32/bs64 peak to a small fraction of it.
+`flash_attention_2` is **not** the lever: the model already uses `sdpa`
+(memory-efficient attention), so attention matrices aren't materialized. Arch A is
+the heavy one because its 200-step forecast is a **2× rollout** (two backbone
+forwards in the graph) — `--grad-checkpoint` targets exactly that. None of these
+change results: accumulation preserves the effective batch; bf16 is a minor
+numerical change. `--low-mem` brings Arch A from ~7 GB to ~1–2 GB.
 
 ## Training on a GPU box, evaluating / plotting here
 

@@ -53,29 +53,16 @@ def _build():
     class ArchAForecaster(nn.Module):
         """LoRA TimesFM 2.5 forecaster with a 200-step rollout head.
 
-        ``grad_checkpoint=True`` recomputes each backbone forward during the
-        backward pass (via ``torch.utils.checkpoint``) instead of storing its
-        20-layer activations — the main lever for the rollout's 2x activation
-        cost. Trades ~one extra forward of compute for a large memory cut.
+        Memory: the 200-step forecast is a 2-pass rollout, so activation memory is
+        ~2x a single forward. Enable per-layer gradient checkpointing at build
+        time (``build_model(grad_checkpoint=True)``) to recompute layer
+        activations in backward instead of storing them.
         """
 
-        def __init__(self, backbone, horizon: int = HORIZON_N, grad_checkpoint: bool = False):
+        def __init__(self, backbone, horizon: int = HORIZON_N):
             super().__init__()
             self.backbone = backbone
             self.horizon = horizon
-            self.grad_checkpoint = grad_checkpoint
-
-        def _forward_once(self, ctx):
-            import torch
-            from torch.utils.checkpoint import checkpoint
-
-            if self.grad_checkpoint and self.training:
-                # use_reentrant=False works even though the input doesn't require grad
-                return checkpoint(
-                    lambda c: self.backbone(past_values=c).mean_predictions,
-                    ctx, use_reentrant=False,
-                )
-            return self.backbone(past_values=ctx).mean_predictions
 
         def forecast_batch(self, x):
             """Autoregressive point forecast of length ``horizon`` (normalized).
@@ -84,13 +71,13 @@ def _build():
             """
             import torch
 
-            f = self._forward_once(x)                              # (B, 128)
+            f = self.backbone(past_values=x).mean_predictions     # (B, 128)
             if f.shape[1] >= self.horizon:
                 return f[:, : self.horizon]
             out, ctx, got = [f], x, f.shape[1]
             while got < self.horizon:
                 ctx = torch.cat([ctx, out[-1]], dim=1)
-                out.append(self._forward_once(ctx))
+                out.append(self.backbone(past_values=ctx).mean_predictions)
                 got += out[-1].shape[1]
             return torch.cat(out, dim=1)[:, : self.horizon]
 
@@ -104,8 +91,10 @@ def build_model(device: str | None = None, dtype=None, attn_implementation: str 
                 grad_checkpoint: bool = False):
     device = lc.pick_device(device)
     peft_model = lc.build_lora_model(device, dtype=dtype, attn_implementation=attn_implementation)
+    if grad_checkpoint:
+        lc.enable_layer_checkpointing(peft_model)
     Cls = _build()
-    model = Cls(peft_model, grad_checkpoint=grad_checkpoint).to(device)
+    model = Cls(peft_model).to(device)
     return model, device
 
 
@@ -203,6 +192,9 @@ def train(
     import copy
     from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
+    if str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+
     best_val = float("inf")
     epoch1_val = None
     best_state = None
@@ -216,7 +208,9 @@ def train(
         if ep == 1:
             epoch1_val = va_mae
         dt = time.time() - t0
-        print(f"[arch_a] epoch {ep:02d}  train_MAE={tr_mae:.5f}  val_MAE={va_mae:.5f}  ({dt:.1f}s)")
+        peak = lc.cuda_peak_gb(device)
+        mem = f"  peak={peak:.2f}GB" if peak is not None else ""
+        print(f"[arch_a] epoch {ep:02d}  train_MAE={tr_mae:.5f}  val_MAE={va_mae:.5f}  ({dt:.1f}s){mem}")
         if va_mae < best_val - 1e-6:
             best_val, bad = va_mae, 0
             best_state = copy.deepcopy(get_peft_model_state_dict(model.backbone))
@@ -280,15 +274,24 @@ def main():
     ap.add_argument("--bf16", action="store_true", help="load model in bfloat16 (~half the memory)")
     ap.add_argument("--accum-steps", type=int, default=1, help="gradient accumulation micro-steps")
     ap.add_argument("--grad-checkpoint", action="store_true", help="recompute activations in backward")
+    ap.add_argument("--low-mem", action="store_true",
+                    help="preset for small GPUs: bf16(CUDA)+grad-checkpoint+batch 8+accum 8")
     ap.add_argument("--attn", default=None, choices=["sdpa", "flash_attention_2", "eager"],
                     help="attention impl (default sdpa); flash_attention_2 needs flash-attn+CUDA")
     args = ap.parse_args()
     if args.smoke:
         smoke()
-    else:
-        train(epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
-              dtype="bf16" if args.bf16 else None, attn_implementation=args.attn,
-              grad_checkpoint=args.grad_checkpoint, accum_steps=args.accum_steps)
+        return
+    bf16, gc_flag, bs, accum = args.bf16, args.grad_checkpoint, args.batch_size, args.accum_steps
+    if args.low_mem:
+        import torch as _t
+        gc_flag = True
+        bs = 8 if args.batch_size == DEFAULT_BS else args.batch_size
+        accum = 8 if args.accum_steps == 1 else args.accum_steps
+        bf16 = bf16 or _t.cuda.is_available()
+    train(epochs=args.epochs, batch_size=bs, seed=args.seed,
+          dtype="bf16" if bf16 else None, attn_implementation=args.attn,
+          grad_checkpoint=gc_flag, accum_steps=accum)
 
 
 if __name__ == "__main__":

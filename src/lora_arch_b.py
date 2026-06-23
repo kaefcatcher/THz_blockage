@@ -63,22 +63,15 @@ def _build():
     import torch.nn as nn
 
     class ArchBClassifier(nn.Module):
-        def __init__(self, backbone, d_model: int = lc.D_MODEL, grad_checkpoint: bool = False):
+        def __init__(self, backbone, d_model: int = lc.D_MODEL):
             super().__init__()
             self.backbone = backbone
             self.head = nn.Linear(d_model, 1)
             self.decision_threshold = 0.5  # overwritten by the val sweep
-            self.grad_checkpoint = grad_checkpoint
 
         def logits_batch(self, x):
             """(B, Wn) normalized history -> (B,) logits."""
-            if self.grad_checkpoint and self.training:
-                from torch.utils.checkpoint import checkpoint
-
-                h = checkpoint(lambda c: self.backbone(past_values=c).last_hidden_state,
-                               x, use_reentrant=False)
-            else:
-                h = self.backbone(past_values=x).last_hidden_state   # (B, 512, d_model)
+            h = self.backbone(past_values=x).last_hidden_state   # (B, 512, d_model)
             k = n_valid_patches(x.shape[1])
             pooled = h[:, -k:, :].mean(dim=1)          # (B, d_model)
             pooled = pooled.to(self.head.weight.dtype)  # keep head matmul dtype-safe (bf16 backbone)
@@ -94,7 +87,9 @@ def build_model(device: str | None = None, dtype=None, attn_implementation: str 
                 grad_checkpoint: bool = False):
     device = lc.pick_device(device)
     peft_model = lc.build_lora_model(device, dtype=dtype, attn_implementation=attn_implementation)
-    model = _build()(peft_model, grad_checkpoint=grad_checkpoint).to(device)
+    if grad_checkpoint:
+        lc.enable_layer_checkpointing(peft_model)
+    model = _build()(peft_model).to(device)
     # combined trainable budget (LoRA + head) must still be < 200k
     trainable, _total, _pct = lc.count_trainable(model)
     print(f"[arch_b] combined trainable (LoRA+head) = {trainable:,}")
@@ -223,6 +218,9 @@ def train(
     import copy
     from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
+    if str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+
     best_f1, best_t, bad = -1.0, 0.5, 0
     best_state = None
     f1_at_ep10 = None
@@ -248,7 +246,9 @@ def train(
         y_va, p_va = _val_probs(model, va_ld, device)
         ep_f1, ep_t = best_threshold_f1(y_va, p_va)
         dt = time.time() - t0
-        print(f"[arch_b] epoch {ep:02d}  val_F1={ep_f1:.4f}@thr={ep_t:.2f}  ({dt:.1f}s)")
+        peak = lc.cuda_peak_gb(device)
+        mem = f"  peak={peak:.2f}GB" if peak is not None else ""
+        print(f"[arch_b] epoch {ep:02d}  val_F1={ep_f1:.4f}@thr={ep_t:.2f}  ({dt:.1f}s){mem}")
         if ep <= 10:
             f1_at_ep10 = ep_f1
         if ep_f1 > best_f1 + 1e-6:
@@ -335,18 +335,27 @@ def main():
     ap.add_argument("--bf16", action="store_true", help="load model in bfloat16 (~half the memory)")
     ap.add_argument("--accum-steps", type=int, default=1, help="gradient accumulation micro-steps")
     ap.add_argument("--grad-checkpoint", action="store_true", help="recompute activations in backward")
+    ap.add_argument("--low-mem", action="store_true",
+                    help="preset for small GPUs: bf16(CUDA)+grad-checkpoint+batch 8+accum 8")
     ap.add_argument("--attn", default=None, choices=["sdpa", "flash_attention_2", "eager"])
     args = ap.parse_args()
     if args.smoke:
         smoke()
-    else:
-        # Keep the two losses in separate dirs so they don't overwrite each
-        # other; BCE is the canonical arch_b checkpoint used by the PR curve.
-        save_dir = CKPT_DIR if args.loss == "bce" else CKPT_DIR.parent / "arch_b_focal"
-        train(loss_kind=args.loss, epochs=args.epochs, batch_size=args.batch_size,
-              seed=args.seed, save_dir=save_dir,
-              dtype="bf16" if args.bf16 else None, attn_implementation=args.attn,
-              grad_checkpoint=args.grad_checkpoint, accum_steps=args.accum_steps)
+        return
+    bf16, gc_flag, bs, accum = args.bf16, args.grad_checkpoint, args.batch_size, args.accum_steps
+    if args.low_mem:
+        import torch as _t
+        gc_flag = True
+        bs = 8 if args.batch_size == DEFAULT_BS else args.batch_size
+        accum = 8 if args.accum_steps == 1 else args.accum_steps
+        bf16 = bf16 or _t.cuda.is_available()
+    # Keep the two losses in separate dirs so they don't overwrite each other;
+    # BCE is the canonical arch_b checkpoint used by the PR curve.
+    save_dir = CKPT_DIR if args.loss == "bce" else CKPT_DIR.parent / "arch_b_focal"
+    train(loss_kind=args.loss, epochs=args.epochs, batch_size=bs,
+          seed=args.seed, save_dir=save_dir,
+          dtype="bf16" if bf16 else None, attn_implementation=args.attn,
+          grad_checkpoint=gc_flag, accum_steps=accum)
 
 
 if __name__ == "__main__":
