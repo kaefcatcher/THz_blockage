@@ -46,14 +46,21 @@ TW = data.TRAIN_TW_MS  # 50
 # A single train+eval run (real; needs a GPU for non-trivial sizes)
 # --------------------------------------------------------------------------- #
 def run_one(arch: str, train_files, seed: int, loss: str = "bce", device=None,
-            epochs: int | None = None) -> dict:
-    """Train one model from scratch and evaluate on the frozen 24-trace eval set."""
+            epochs: int | None = None, train_kwargs: dict | None = None) -> dict:
+    """Train one model from scratch and evaluate on the frozen 24-trace eval set.
+
+    ``train_kwargs`` forwards memory levers (e.g. ``dtype="bf16"``,
+    ``grad_checkpoint=True``, ``accum_steps=4``, ``batch_size=16``) to the
+    architecture's ``train()``.
+    """
     import lora_arch_a
     import lora_arch_b
 
     theta = data.get_theta()
     eval_files = data.get_eval_files()
-    kw = {} if epochs is None else {"epochs": epochs}
+    kw = dict(train_kwargs or {})
+    if epochs is not None:
+        kw["epochs"] = epochs
     with tempfile.TemporaryDirectory() as tmp:
         if arch == "A":
             model, _ = lora_arch_a.train(
@@ -89,19 +96,20 @@ def _free():
 # --------------------------------------------------------------------------- #
 # Step 5 — assemble metrics_main.csv (zero-shot is real; arch rows trained)
 # --------------------------------------------------------------------------- #
-def build_metrics_main(device=None, epochs=None) -> pd.DataFrame:
+def build_metrics_main(device=None, epochs=None, train_kwargs=None) -> pd.DataFrame:
     pool = data.get_train_pool_files()
     n216 = pool
     n40 = data.sample_traces_stratified(pool, 40, seed=0)
+    tk = train_kwargs
 
     rows = [ev.zeroshot_row(TW)]
-    ma = run_one("A", n216, seed=0, device=device, epochs=epochs)
+    ma = run_one("A", n216, seed=0, device=device, epochs=epochs, train_kwargs=tk)
     rows.append(ev.metrics_row("Arch A (N=216)", TW, ma))
-    mb = run_one("B", n216, seed=0, loss="bce", device=device, epochs=epochs)
+    mb = run_one("B", n216, seed=0, loss="bce", device=device, epochs=epochs, train_kwargs=tk)
     rows.append(ev.metrics_row("Arch B BCE (N=216)", TW, mb))
-    mf = run_one("B", n216, seed=0, loss="focal", device=device, epochs=epochs)
+    mf = run_one("B", n216, seed=0, loss="focal", device=device, epochs=epochs, train_kwargs=tk)
     rows.append(ev.metrics_row("Arch B Focal (N=216)", TW, mf))
-    m40 = run_one("B", n40, seed=0, loss="bce", device=device, epochs=epochs)
+    m40 = run_one("B", n40, seed=0, loss="bce", device=device, epochs=epochs, train_kwargs=tk)
     rows.append(ev.metrics_row("Arch B BCE (N=40)", TW, m40))
 
     df = ev.write_metrics_main(rows)
@@ -112,14 +120,15 @@ def build_metrics_main(device=None, epochs=None) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Step 6 — data efficiency
 # --------------------------------------------------------------------------- #
-def data_efficiency(Ns=N_GRID, seeds=SEEDS, device=None, epochs=None) -> pd.DataFrame:
+def data_efficiency(Ns=N_GRID, seeds=SEEDS, device=None, epochs=None, train_kwargs=None) -> pd.DataFrame:
     pool = data.get_train_pool_files()
     rows = []
     for N in Ns:
         for seed in seeds:
             files = data.sample_traces_stratified(pool, N, seed=seed)
             for arch in ("A", "B"):
-                m = run_one(arch, files, seed=seed, loss="bce", device=device, epochs=epochs)
+                m = run_one(arch, files, seed=seed, loss="bce", device=device, epochs=epochs,
+                            train_kwargs=train_kwargs)
                 rows.append({
                     "arch": arch, "N_traces": N, "seed": seed, "Tw_ms": TW,
                     "acc": round(m["acc"], 4), "precision": round(m["precision"], 4),
@@ -152,7 +161,7 @@ def _sample_config(pool, config_id: int, k: int, seed: int):
     return [files[i] for i in idx]
 
 
-def diversity(seeds=SEEDS, device=None, epochs=None) -> pd.DataFrame:
+def diversity(seeds=SEEDS, device=None, epochs=None, train_kwargs=None) -> pd.DataFrame:
     pool = data.get_train_pool_files()
     eval_files = data.get_eval_files()
     theta = data.get_theta()
@@ -164,11 +173,13 @@ def diversity(seeds=SEEDS, device=None, epochs=None) -> pd.DataFrame:
         for cond, files in (("balanced", balanced), ("homogeneous", homogeneous)):
             import lora_arch_b
 
+            kw = dict(train_kwargs or {})
+            if epochs is not None:
+                kw["epochs"] = epochs
             with tempfile.TemporaryDirectory() as tmp:
                 model, _f1, _t = lora_arch_b.train(
                     loss_kind="bce", train_files=files, seed=seed,
-                    save_dir=Path(tmp), device=device, enforce_gate=False,
-                    **({} if epochs is None else {"epochs": epochs}),
+                    save_dir=Path(tmp), device=device, enforce_gate=False, **kw,
                 )
                 # overall + per-config breakdown
                 mo = ev.evaluate(model, eval_files, TW, theta, arch="arch_b")
@@ -286,14 +297,34 @@ def main():
     ap.add_argument("cmd", choices=["main", "efficiency", "diversity", "synthetic", "all"])
     ap.add_argument("--epochs", type=int, default=None, help="override (e.g. small for smoke)")
     ap.add_argument("--device", default=None)
+    # memory levers forwarded to every training run
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--accum-steps", type=int, default=None)
+    ap.add_argument("--grad-checkpoint", action="store_true")
+    ap.add_argument("--attn", default=None, choices=["sdpa", "flash_attention_2", "eager"])
     args = ap.parse_args()
+
+    tk: dict = {}
+    if args.bf16:
+        tk["dtype"] = "bf16"
+    if args.batch_size is not None:
+        tk["batch_size"] = args.batch_size
+    if args.accum_steps is not None:
+        tk["accum_steps"] = args.accum_steps
+    if args.grad_checkpoint:
+        tk["grad_checkpoint"] = True
+    if args.attn:
+        tk["attn_implementation"] = args.attn
+    tk = tk or None
+
     if args.cmd in ("main", "all"):
-        build_metrics_main(device=args.device, epochs=args.epochs)
+        build_metrics_main(device=args.device, epochs=args.epochs, train_kwargs=tk)
     if args.cmd in ("efficiency", "all"):
-        data_efficiency(device=args.device, epochs=args.epochs)
+        data_efficiency(device=args.device, epochs=args.epochs, train_kwargs=tk)
         verify_efficiency_matches_main()
     if args.cmd in ("diversity", "all"):
-        diversity(device=args.device, epochs=args.epochs)
+        diversity(device=args.device, epochs=args.epochs, train_kwargs=tk)
     if args.cmd == "synthetic":
         synthetic()
 

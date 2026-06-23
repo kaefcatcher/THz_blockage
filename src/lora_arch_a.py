@@ -51,12 +51,31 @@ def _build():
     import torch.nn as nn
 
     class ArchAForecaster(nn.Module):
-        """LoRA TimesFM 2.5 forecaster with a 200-step rollout head."""
+        """LoRA TimesFM 2.5 forecaster with a 200-step rollout head.
 
-        def __init__(self, backbone, horizon: int = HORIZON_N):
+        ``grad_checkpoint=True`` recomputes each backbone forward during the
+        backward pass (via ``torch.utils.checkpoint``) instead of storing its
+        20-layer activations — the main lever for the rollout's 2x activation
+        cost. Trades ~one extra forward of compute for a large memory cut.
+        """
+
+        def __init__(self, backbone, horizon: int = HORIZON_N, grad_checkpoint: bool = False):
             super().__init__()
             self.backbone = backbone
             self.horizon = horizon
+            self.grad_checkpoint = grad_checkpoint
+
+        def _forward_once(self, ctx):
+            import torch
+            from torch.utils.checkpoint import checkpoint
+
+            if self.grad_checkpoint and self.training:
+                # use_reentrant=False works even though the input doesn't require grad
+                return checkpoint(
+                    lambda c: self.backbone(past_values=c).mean_predictions,
+                    ctx, use_reentrant=False,
+                )
+            return self.backbone(past_values=ctx).mean_predictions
 
         def forecast_batch(self, x):
             """Autoregressive point forecast of length ``horizon`` (normalized).
@@ -65,15 +84,14 @@ def _build():
             """
             import torch
 
-            f = self.backbone(past_values=x).mean_predictions      # (B, 128)
+            f = self._forward_once(x)                              # (B, 128)
             if f.shape[1] >= self.horizon:
                 return f[:, : self.horizon]
             out, ctx, got = [f], x, f.shape[1]
             while got < self.horizon:
                 ctx = torch.cat([ctx, out[-1]], dim=1)
-                nxt = self.backbone(past_values=ctx).mean_predictions
-                out.append(nxt)
-                got += nxt.shape[1]
+                out.append(self._forward_once(ctx))
+                got += out[-1].shape[1]
             return torch.cat(out, dim=1)[:, : self.horizon]
 
         def forward(self, x):
@@ -82,11 +100,12 @@ def _build():
     return ArchAForecaster
 
 
-def build_model(device: str | None = None):
+def build_model(device: str | None = None, dtype=None, attn_implementation: str | None = None,
+                grad_checkpoint: bool = False):
     device = lc.pick_device(device)
-    peft_model = lc.build_lora_model(device)
+    peft_model = lc.build_lora_model(device, dtype=dtype, attn_implementation=attn_implementation)
     Cls = _build()
-    model = Cls(peft_model).to(device)
+    model = Cls(peft_model, grad_checkpoint=grad_checkpoint).to(device)
     return model, device
 
 
@@ -109,24 +128,36 @@ def mae_loss(forecast, target):
     return (forecast - target).abs().mean()
 
 
-def _run_epoch(model, loader, device, optimizer=None):
+def _run_epoch(model, loader, device, optimizer=None, accum_steps: int = 1):
+    """One epoch. ``accum_steps>1`` accumulates gradients over micro-batches so a
+    small per-step batch keeps the effective batch size while cutting peak memory.
+    """
     import torch
 
     train = optimizer is not None
     model.train(train)
-    total, n = 0.0, 0
-    for x, fut, _label, _mean, _std in loader:
-        x = x.to(device)
-        fut = fut.to(device)
+    mdtype = next(model.parameters()).dtype
+    total, n, pending = 0.0, 0, 0
+    if train:
+        optimizer.zero_grad()
+    for i, (x, fut, _label, _mean, _std) in enumerate(loader):
+        x = x.to(device, dtype=mdtype)
+        fut = fut.to(device, dtype=mdtype)
         with torch.set_grad_enabled(train):
             fc = model.forecast_batch(x)
             loss = mae_loss(fc, fut)
             if train:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                (loss / accum_steps).backward()
+                pending += 1
+                if (i + 1) % accum_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    pending = 0
         total += float(loss) * x.size(0)
         n += x.size(0)
+    if train and pending > 0:        # flush a partial accumulation window
+        optimizer.step()
+        optimizer.zero_grad()
     return total / max(n, 1)
 
 
@@ -142,6 +173,10 @@ def train(
     save_dir: Path = CKPT_DIR,
     device: str | None = None,
     max_steps: int | None = None,
+    dtype=None,
+    attn_implementation: str | None = None,
+    grad_checkpoint: bool = False,
+    accum_steps: int = 1,
 ):
     import torch
     from torch.utils.data import DataLoader
@@ -150,14 +185,16 @@ def train(
     theta = data.get_theta()
     pool = train_files if train_files is not None else data.get_train_pool_files()
     tr_files, va_files = data.split_train_val(pool, val_frac=0.10, seed=seed)
-    print(f"[arch_a] train traces={len(tr_files)} val traces={len(va_files)} Tw={tw_ms}ms")
+    print(f"[arch_a] train traces={len(tr_files)} val traces={len(va_files)} Tw={tw_ms}ms "
+          f"bs={batch_size} accum={accum_steps} dtype={dtype or 'fp32'} ckpt={grad_checkpoint}")
 
     tr_ds = data.BlockageDataset(tr_files, tw_ms, theta=theta, task="forecast")
     va_ds = data.BlockageDataset(va_files, tw_ms, theta=theta, task="forecast")
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
 
-    model, device = build_model(device)
+    model, device = build_model(device, dtype=dtype, attn_implementation=attn_implementation,
+                                grad_checkpoint=grad_checkpoint)
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=LR, weight_decay=WEIGHT_DECAY
     )
@@ -173,7 +210,7 @@ def train(
     save_dir.mkdir(parents=True, exist_ok=True)
     for ep in range(1, epochs + 1):
         t0 = time.time()
-        tr_mae = _run_epoch(model, tr_ld, device, opt)
+        tr_mae = _run_epoch(model, tr_ld, device, opt, accum_steps=accum_steps)
         sched.step()
         va_mae = _run_epoch(model, va_ld, device, None)
         if ep == 1:
@@ -239,11 +276,19 @@ def main():
     ap.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BS)
     ap.add_argument("--seed", type=int, default=0)
+    # memory levers (see README "Out-of-memory" section)
+    ap.add_argument("--bf16", action="store_true", help="load model in bfloat16 (~half the memory)")
+    ap.add_argument("--accum-steps", type=int, default=1, help="gradient accumulation micro-steps")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="recompute activations in backward")
+    ap.add_argument("--attn", default=None, choices=["sdpa", "flash_attention_2", "eager"],
+                    help="attention impl (default sdpa); flash_attention_2 needs flash-attn+CUDA")
     args = ap.parse_args()
     if args.smoke:
         smoke()
     else:
-        train(epochs=args.epochs, batch_size=args.batch_size, seed=args.seed)
+        train(epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
+              dtype="bf16" if args.bf16 else None, attn_implementation=args.attn,
+              grad_checkpoint=args.grad_checkpoint, accum_steps=args.accum_steps)
 
 
 if __name__ == "__main__":

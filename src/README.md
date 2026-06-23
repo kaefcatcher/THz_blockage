@@ -78,6 +78,38 @@ Use `--epochs N` on `experiments.py` / arch scripts for quick GPU smoke runs.
 7. **Diversity homogeneous condition samples with replacement** to reach 40 traces
    per config (each config's training pool has only 27), logged at runtime.
 
+## Out-of-memory during training
+
+The backbone already uses `sdpa` (memory-efficient attention) by default, so
+`flash_attention_2` gives only a marginal gain over what you have — and it needs
+the `flash-attn` package plus a CUDA Ampere+ GPU. The levers that actually move
+peak memory, cheapest first:
+
+| Lever | Flag | Effect |
+|-------|------|--------|
+| smaller batch | `--batch-size 16` | ~linear memory drop; fixes a small overshoot instantly |
+| gradient accumulation | `--accum-steps 4` | keep effective batch, pay memory for only the micro-batch |
+| bfloat16 | `--bf16` | ~halves weight **and** activation memory |
+| activation checkpointing | `--grad-checkpoint` | recompute activations in backward; biggest cut, ~+1 forward of compute |
+| flash attention | `--attn flash_attention_2` | marginal here; needs `flash-attn` + CUDA |
+
+Arch A is the memory-heavy one: its 200-step forecast is a **2× rollout** (two
+backbone forwards kept in the graph), so `--grad-checkpoint` is the highest-impact
+flag there. For a ~100 MB overshoot, `--batch-size 32` alone is usually enough.
+Examples:
+
+```bash
+python src/lora_arch_a.py --batch-size 16                 # quick fix
+python src/lora_arch_a.py --bf16 --grad-checkpoint        # large headroom
+python src/lora_arch_a.py --batch-size 16 --accum-steps 4 # effective batch 64
+# same flags exist on lora_arch_b.py and experiments.py
+python src/experiments.py efficiency --bf16 --grad-checkpoint --batch-size 32
+```
+
+These don't change results (accumulation preserves the effective batch; bf16 is a
+minor numerical change). Combining `--bf16 --grad-checkpoint --batch-size 16`
+brings Arch A from its fp32/bs64 peak to a small fraction of it.
+
 ## Training on a GPU box, evaluating / plotting here
 
 Bring back only small artifacts — the base weights, raw data and `.cache_npz` are

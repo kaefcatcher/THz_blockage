@@ -63,18 +63,25 @@ def _build():
     import torch.nn as nn
 
     class ArchBClassifier(nn.Module):
-        def __init__(self, backbone, d_model: int = lc.D_MODEL):
+        def __init__(self, backbone, d_model: int = lc.D_MODEL, grad_checkpoint: bool = False):
             super().__init__()
             self.backbone = backbone
             self.head = nn.Linear(d_model, 1)
             self.decision_threshold = 0.5  # overwritten by the val sweep
+            self.grad_checkpoint = grad_checkpoint
 
         def logits_batch(self, x):
             """(B, Wn) normalized history -> (B,) logits."""
-            out = self.backbone(past_values=x)
-            h = out.last_hidden_state                  # (B, 512, d_model)
+            if self.grad_checkpoint and self.training:
+                from torch.utils.checkpoint import checkpoint
+
+                h = checkpoint(lambda c: self.backbone(past_values=c).last_hidden_state,
+                               x, use_reentrant=False)
+            else:
+                h = self.backbone(past_values=x).last_hidden_state   # (B, 512, d_model)
             k = n_valid_patches(x.shape[1])
             pooled = h[:, -k:, :].mean(dim=1)          # (B, d_model)
+            pooled = pooled.to(self.head.weight.dtype)  # keep head matmul dtype-safe (bf16 backbone)
             return self.head(pooled).squeeze(-1)       # (B,)
 
         def forward(self, x):
@@ -83,10 +90,11 @@ def _build():
     return ArchBClassifier
 
 
-def build_model(device: str | None = None):
+def build_model(device: str | None = None, dtype=None, attn_implementation: str | None = None,
+                grad_checkpoint: bool = False):
     device = lc.pick_device(device)
-    peft_model = lc.build_lora_model(device)
-    model = _build()(peft_model).to(device)
+    peft_model = lc.build_lora_model(device, dtype=dtype, attn_implementation=attn_implementation)
+    model = _build()(peft_model, grad_checkpoint=grad_checkpoint).to(device)
     # combined trainable budget (LoRA + head) must still be < 200k
     trainable, _total, _pct = lc.count_trainable(model)
     print(f"[arch_b] combined trainable (LoRA+head) = {trainable:,}")
@@ -146,10 +154,11 @@ def _val_probs(model, loader, device):
     import torch
 
     model.eval()
+    mdtype = next(model.parameters()).dtype
     ys, ps = [], []
     with torch.no_grad():
         for x, label in loader:
-            logits = model.logits_batch(x.to(device)).cpu().numpy().reshape(-1)
+            logits = model.logits_batch(x.to(device, dtype=mdtype)).float().cpu().numpy().reshape(-1)
             ps.append(1.0 / (1.0 + np.exp(-logits)))
             ys.append(label.numpy().astype(int))
     return np.concatenate(ys), np.concatenate(ps)
@@ -180,6 +189,10 @@ def train(
     save_dir: Path = CKPT_DIR,
     device: str | None = None,
     enforce_gate: bool = True,
+    dtype=None,
+    attn_implementation: str | None = None,
+    grad_checkpoint: bool = False,
+    accum_steps: int = 1,
 ):
     import torch
     from torch.utils.data import DataLoader
@@ -198,7 +211,9 @@ def train(
     tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
     va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
 
-    model, device = build_model(device)
+    model, device = build_model(device, dtype=dtype, attn_implementation=attn_implementation,
+                                grad_checkpoint=grad_checkpoint)
+    mdtype = next(model.parameters()).dtype
     loss_fn = make_loss(loss_kind, pos_w)
     opt = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=LR, weight_decay=WEIGHT_DECAY
@@ -215,12 +230,19 @@ def train(
     for ep in range(1, epochs + 1):
         t0 = time.time()
         model.train()
-        for x, label in tr_ld:
-            x = x.to(device)
+        opt.zero_grad()
+        pending = 0
+        for i, (x, label) in enumerate(tr_ld):
+            x = x.to(device, dtype=mdtype)
             label = label.to(device)
             logits = model.logits_batch(x)
             loss = loss_fn(logits, label, device)
-            opt.zero_grad(); loss.backward(); opt.step()
+            (loss / accum_steps).backward()
+            pending += 1
+            if (i + 1) % accum_steps == 0:
+                opt.step(); opt.zero_grad(); pending = 0
+        if pending > 0:
+            opt.step(); opt.zero_grad()
         sched.step()
 
         y_va, p_va = _val_probs(model, va_ld, device)
@@ -310,6 +332,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BS)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--bf16", action="store_true", help="load model in bfloat16 (~half the memory)")
+    ap.add_argument("--accum-steps", type=int, default=1, help="gradient accumulation micro-steps")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="recompute activations in backward")
+    ap.add_argument("--attn", default=None, choices=["sdpa", "flash_attention_2", "eager"])
     args = ap.parse_args()
     if args.smoke:
         smoke()
@@ -318,7 +344,9 @@ def main():
         # other; BCE is the canonical arch_b checkpoint used by the PR curve.
         save_dir = CKPT_DIR if args.loss == "bce" else CKPT_DIR.parent / "arch_b_focal"
         train(loss_kind=args.loss, epochs=args.epochs, batch_size=args.batch_size,
-              seed=args.seed, save_dir=save_dir)
+              seed=args.seed, save_dir=save_dir,
+              dtype="bf16" if args.bf16 else None, attn_implementation=args.attn,
+              grad_checkpoint=args.grad_checkpoint, accum_steps=args.accum_steps)
 
 
 if __name__ == "__main__":

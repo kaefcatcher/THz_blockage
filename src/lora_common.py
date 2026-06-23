@@ -37,18 +37,40 @@ def pick_device(prefer: str | None = None) -> str:
     return "cpu"
 
 
-def load_backbone(device: str | None = None, dtype=None):
+def resolve_dtype(dtype):
+    """Accept None / a torch.dtype / a string ('fp32','fp16','bf16')."""
+    import torch
+
+    if dtype is None:
+        return torch.float32
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    return {
+        "fp32": torch.float32, "float32": torch.float32,
+        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
+        "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+    }[str(dtype).lower()]
+
+
+def load_backbone(device: str | None = None, dtype=None, attn_implementation: str | None = None):
     """Load (and HF-cache) the TimesFM 2.5 backbone.
 
-    The weights are downloaded once into ``~/.cache/huggingface`` and reused.
+    Weights download once into ``~/.cache/huggingface`` and are reused.
+
+    ``dtype`` defaults to fp32 (most stable for LoRA); pass ``"bf16"`` to roughly
+    halve weight+activation memory on a constrained GPU. The model already uses
+    ``sdpa`` (memory-efficient attention) by default; pass
+    ``attn_implementation="flash_attention_2"`` only if the ``flash-attn`` package
+    and a compatible CUDA GPU are available (marginal gain over sdpa here).
     """
-    import torch
+    import torch  # noqa: F401
     from transformers import TimesFm2_5ModelForPrediction
 
     device = pick_device(device)
-    if dtype is None:
-        dtype = torch.float32  # LoRA training is most stable in fp32 on 1 GPU
-    model = TimesFm2_5ModelForPrediction.from_pretrained(BACKBONE_ID, torch_dtype=dtype)
+    kw = {"torch_dtype": resolve_dtype(dtype)}
+    if attn_implementation:
+        kw["attn_implementation"] = attn_implementation
+    model = TimesFm2_5ModelForPrediction.from_pretrained(BACKBONE_ID, **kw)
     model.to(device)
     return model
 
@@ -169,9 +191,10 @@ def verify_frozen(model, last_n: int = LAST_N) -> None:
     print(f"[verify] layers 0..{n - last_n - 1} are frozen (no trainable params)")
 
 
-def build_lora_model(device: str | None = None, last_n: int = LAST_N):
+def build_lora_model(device: str | None = None, last_n: int = LAST_N, dtype=None,
+                     attn_implementation: str | None = None):
     """One-shot: load backbone, apply LoRA, run both assertions, return model."""
-    model = load_backbone(device)
+    model = load_backbone(device, dtype=dtype, attn_implementation=attn_implementation)
     peft_model, targets = apply_lora(model, last_n=last_n)
     print(f"[lora] target_modules ({len(targets)}):")
     for t in targets:

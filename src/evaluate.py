@@ -90,14 +90,15 @@ def _arch_a_scores(model, eval_traces, Tw_ms, theta):
     ds = data.BlockageDataset(eval_traces, Tw_ms, theta=theta, task="forecast")
     loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=False)
     model.eval()
-    device = next(model.parameters()).device if hasattr(model, "parameters") else "cpu"
+    p0 = next(model.parameters())
+    device, mdtype = p0.device, p0.dtype
 
     y_true, margins, y_pred = [], [], []
     with torch.no_grad():
         for x, _fut, label, mean, std in loader:
-            x = x.to(device)
+            x = x.to(device, dtype=mdtype)
             fc = model.forecast_batch(x)                  # (B, horizon) normalized
-            fc = fc.cpu()
+            fc = fc.float().cpu()                         # float(): numpy has no bf16
             denorm = fc * std[:, None] + mean[:, None]    # back to linear units
             min_fc = denorm.min(dim=1).values.numpy()
             margins.append(theta - min_fc)                # >0 => below threshold
@@ -120,13 +121,14 @@ def _arch_b_scores(model, eval_traces, Tw_ms, theta, decision_threshold=None):
     ds = data.BlockageDataset(eval_traces, Tw_ms, theta=theta, task="classify")
     loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=False)
     model.eval()
-    device = next(model.parameters()).device if hasattr(model, "parameters") else "cpu"
+    p0 = next(model.parameters())
+    device, mdtype = p0.device, p0.dtype
 
     y_true, probs = [], []
     with torch.no_grad():
         for x, label in loader:
-            x = x.to(device)
-            logits = model.logits_batch(x).cpu().numpy().reshape(-1)
+            x = x.to(device, dtype=mdtype)
+            logits = model.logits_batch(x).float().cpu().numpy().reshape(-1)
             probs.append(1.0 / (1.0 + np.exp(-logits)))
             y_true.append(label.numpy().astype(int))
     y_true = np.concatenate(y_true)
