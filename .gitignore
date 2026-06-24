@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+
+# Caches / OS
+.cache_npz/
+.DS_Store
+**/.DS_Store
+
+# Local clones not part of this repo
+timesfm/
+
+# Colab/local scratch (outputs are intentionally NOT ignored so trained
+# checkpoints/metrics/figures can be committed back from the collab branch)
+*.zip
